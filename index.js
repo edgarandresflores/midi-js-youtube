@@ -26,6 +26,7 @@ const PROFILE_DIRECTORY = ".youtube-chrome-profile";
  * Mapeo MIDI:
  *
  * CC 7  → volumen continuo (valor MIDI 0-127)
+ * CC 100 → pedal de expresión / velocidad 0-100%
  * CC 80 → inicio
  * CC 81 → marcador 1 (por defecto 1:35)
  * CC 82 → marcador 2 (por defecto 2:50)
@@ -54,12 +55,21 @@ const lastControllerPress = new Map();
 
 const MIDI_DEBOUNCE_MS = 150;
 const VOLUME_CONTROLLER = 7;
+const EXPRESSION_CONTROLLER = 100;
+const MIDI_VALUE_MAX = 127;
+const EXPRESSION_VALUE_MAX = 100;
+const MIN_PLAYBACK_RATE = 0.25;
+const EXPRESSION_THROTTLE_MS = 80;
 
 let browser = null;
 let midiProcess = null;
 let shuttingDown = false;
 
 let rememberedYouTubeState = defaultYouTubeState();
+let pendingExpressionValue = null;
+let expressionUpdateInFlight = false;
+let expressionUpdateTimeout = null;
+let lastExpressionUpdateAt = 0;
 
 async function main() {
     browser = await launchYouTubeBrowser();
@@ -335,16 +345,23 @@ async function handleMidiEvent(event) {
     );
 
     /*
-     * El volumen es un control continuo.
+     * El volumen y el pedal de expresión son controles continuos.
      *
      * A diferencia de los footswitches, también debe
      * aceptar el valor 0 y no aplica debounce.
      */
-    if (
-        event.controller ===
-        VOLUME_CONTROLLER
-    ) {
-        await setYouTubeVolume(event.value);
+    if (event.controller === VOLUME_CONTROLLER) {
+        await setYouTubeVolume(
+            event.value,
+            MIDI_VALUE_MAX
+        );
+
+        return;
+    }
+
+    if (event.controller === EXPRESSION_CONTROLLER) {
+        scheduleYouTubePlaybackRatePercent(event.value);
+
         return;
     }
 
@@ -915,13 +932,16 @@ async function toggleYouTubeMute() {
     );
 }
 
-async function setYouTubeVolume(midiValue) {
+async function setYouTubeVolume(
+    midiValue,
+    maximumValue = MIDI_VALUE_MAX
+) {
     const normalizedValue =
         clamp(
             Number(midiValue),
             0,
-            127
-        ) / 127;
+            maximumValue
+        ) / maximumValue;
 
     const result =
         await runYouTubeVideoCommand(
@@ -949,6 +969,99 @@ async function cycleYouTubePlaybackRate() {
     console.log(
         `[YouTube] Velocidad: ` +
         `${result.playbackRate}x`
+    );
+}
+
+function scheduleYouTubePlaybackRatePercent(value) {
+    pendingExpressionValue = clamp(
+        Number(value),
+        0,
+        EXPRESSION_VALUE_MAX
+    );
+
+    if (
+        expressionUpdateInFlight ||
+        expressionUpdateTimeout
+    ) {
+        return;
+    }
+
+    const elapsed =
+        Date.now() - lastExpressionUpdateAt;
+
+    const delay = Math.max(
+        0,
+        EXPRESSION_THROTTLE_MS - elapsed
+    );
+
+    expressionUpdateTimeout = setTimeout(
+        flushYouTubePlaybackRatePercent,
+        delay
+    );
+}
+
+async function flushYouTubePlaybackRatePercent() {
+    expressionUpdateTimeout = null;
+
+    if (expressionUpdateInFlight) {
+        return;
+    }
+
+    const value = pendingExpressionValue;
+    pendingExpressionValue = null;
+
+    if (value === null) {
+        return;
+    }
+
+    expressionUpdateInFlight = true;
+
+    try {
+        await setYouTubePlaybackRatePercent(value);
+    } catch (error) {
+        console.error(
+            "[YouTube] Error actualizando velocidad:",
+            error.message
+        );
+    } finally {
+        expressionUpdateInFlight = false;
+        lastExpressionUpdateAt = Date.now();
+
+        if (pendingExpressionValue !== null) {
+            scheduleYouTubePlaybackRatePercent(
+                pendingExpressionValue
+            );
+        }
+    }
+}
+
+async function setYouTubePlaybackRatePercent(value) {
+    const percent = clamp(
+        Number(value),
+        0,
+        EXPRESSION_VALUE_MAX
+    );
+
+    const playbackRate =
+        clamp(
+            percent / 100,
+            MIN_PLAYBACK_RATE,
+            1
+        );
+
+    const result =
+        await runYouTubeVideoCommand(
+            "setPlaybackRate",
+            {
+                playbackRate,
+                minimumPlaybackRate: MIN_PLAYBACK_RATE
+            }
+        );
+
+    console.log(
+        `[YouTube] Velocidad: ` +
+        `${Math.round(result.playbackRate * 100)}% ` +
+        `(${result.playbackRate}x)`
     );
 }
 
@@ -1297,9 +1410,13 @@ async function runYouTubeVideoCommand(
                         : video.volume,
 
                 playbackRate:
-                    hasPlayerMethod("getPlaybackRate")
-                        ? player.getPlaybackRate()
-                        : video.playbackRate,
+                    Number.isFinite(video.playbackRate)
+                        ? video.playbackRate
+                        : (
+                            hasPlayerMethod("getPlaybackRate")
+                                ? player.getPlaybackRate()
+                                : 1
+                        ),
 
                 title:
                     document.querySelector(
@@ -1393,6 +1510,69 @@ async function runYouTubeVideoCommand(
                     }
 
                     return state();
+
+                case "setPlaybackRate": {
+                    const nextRate =
+                        clampValue(
+                            payload.playbackRate,
+                            payload.minimumPlaybackRate,
+                            1
+                        );
+
+                    if (
+                        hasPlayerMethod("setPlaybackRate") &&
+                        hasPlayerMethod(
+                            "getAvailablePlaybackRates"
+                        )
+                    ) {
+                        const availableRates =
+                            player
+                                .getAvailablePlaybackRates()
+                                .filter(rate =>
+                                    rate >=
+                                    payload.minimumPlaybackRate &&
+                                    rate <= 1
+                                );
+
+                        if (availableRates.length > 0) {
+                            const nearestRate =
+                                availableRates.reduce(
+                                    (closest, rate) => (
+                                        Math.abs(
+                                            rate - nextRate
+                                        ) <
+                                        Math.abs(
+                                            closest - nextRate
+                                        )
+                                            ? rate
+                                            : closest
+                                    )
+                                );
+
+                            player.setPlaybackRate(
+                                nearestRate
+                            );
+                        }
+                    }
+
+                    video.defaultPlaybackRate =
+                        nextRate;
+
+                    video.playbackRate =
+                        nextRate;
+
+                    await new Promise(resolve =>
+                        setTimeout(resolve, 30)
+                    );
+
+                    video.defaultPlaybackRate =
+                        nextRate;
+
+                    video.playbackRate =
+                        nextRate;
+
+                    return state();
+                }
 
                 case "cyclePlaybackRate": {
                     const rates =

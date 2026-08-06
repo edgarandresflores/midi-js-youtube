@@ -62,28 +62,20 @@ let shuttingDown = false;
 let rememberedYouTubeState = defaultYouTubeState();
 
 async function main() {
-    browser = await puppeteer.launch({
-        headless: false,
+    browser = await launchYouTubeBrowser();
 
-        /*
-         * Usa un perfil independiente del Chrome normal.
-         * Conserva sesión, cookies y configuración de YouTube.
-         */
-        userDataDir: path.resolve(
-            __dirname,
-            PROFILE_DIRECTORY
-        ),
+    browser.on("targetcreated", async target => {
+        if (target.type() !== "page") {
+            return;
+        }
 
-        defaultViewport: null,
-
-        args: [
-            "--start-maximized",
-
-            /*
-             * Facilita la reproducción iniciada mediante MIDI.
-             */
-            "--autoplay-policy=no-user-gesture-required"
-        ]
+        try {
+            await prepareYouTubePage(
+                await target.page()
+            );
+        } catch {
+            // No es crítico: puede ser una pestaña interna de Chrome.
+        }
     });
 
     const page = await getOrCreateYouTubePage(
@@ -117,8 +109,89 @@ async function main() {
     );
 }
 
+async function launchYouTubeBrowser() {
+    const launchOptions = {
+        headless: false,
+
+        /*
+         * Usa un perfil independiente del Chrome normal.
+         * Conserva sesión, cookies y configuración de YouTube.
+         */
+        userDataDir: path.resolve(
+            __dirname,
+            PROFILE_DIRECTORY
+        ),
+
+        defaultViewport: null,
+
+        ignoreDefaultArgs: [
+            "--enable-automation"
+        ],
+
+        args: [
+            "--start-maximized",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-default-browser-check",
+            "--no-first-run",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-features=CalculateNativeWinOcclusion",
+
+            /*
+             * Facilita la reproducción iniciada mediante MIDI.
+             */
+            "--autoplay-policy=no-user-gesture-required"
+        ]
+    };
+
+    try {
+        return await puppeteer.launch({
+            ...launchOptions,
+            channel: "chrome"
+        });
+    } catch (error) {
+        console.warn(
+            "[Chrome] No se pudo usar Google Chrome instalado. " +
+            "Probando con el navegador de Puppeteer:",
+            error.message
+        );
+
+        return puppeteer.launch(launchOptions);
+    }
+}
+
+async function prepareYouTubePage(page) {
+    if (!page) {
+        return;
+    }
+
+    const hideWebDriver = () => {
+        Object.defineProperty(
+            navigator,
+            "webdriver",
+            {
+                get: () => false
+            }
+        );
+    };
+
+    await page.evaluateOnNewDocument(hideWebDriver);
+
+    try {
+        await page.evaluate(hideWebDriver);
+    } catch {
+        // La página puede estar navegando o ser about:blank.
+    }
+}
+
 async function getOrCreateYouTubePage(initialUrl) {
     const pages = await browser.pages();
+
+    await Promise.all(
+        pages.map(page => prepareYouTubePage(page))
+    );
 
     const existingPage = pages.find(
         page => isYouTubeUrl(page.url())
@@ -1056,6 +1129,14 @@ async function runYouTubeVideoCommand(
                 );
             }
 
+            const player =
+                document.querySelector("#movie_player");
+
+            const hasPlayerMethod = method => (
+                player &&
+                typeof player[method] === "function"
+            );
+
             const waitForMetadata =
                 async () => {
                     if (
@@ -1125,24 +1206,100 @@ async function runYouTubeVideoCommand(
                 maximum
             );
 
+            const playerNumber = method => {
+                if (!hasPlayerMethod(method)) {
+                    return NaN;
+                }
+
+                const value = player[method]();
+
+                return Number.isFinite(value)
+                    ? value
+                    : NaN;
+            };
+
+            const getDuration = fallback => {
+                const playerDuration =
+                    playerNumber("getDuration");
+
+                if (playerDuration > 0) {
+                    return playerDuration;
+                }
+
+                if (Number.isFinite(video.duration)) {
+                    return video.duration;
+                }
+
+                return fallback;
+            };
+
+            const getCurrentTime = () => {
+                const playerCurrentTime =
+                    playerNumber("getCurrentTime");
+
+                return Number.isFinite(playerCurrentTime)
+                    ? playerCurrentTime
+                    : video.currentTime;
+            };
+
+            const seekTo = async (
+                seconds,
+                playAfterSeek
+            ) => {
+                const targetSeconds =
+                    clampValue(
+                        seconds,
+                        0,
+                        getDuration(seconds)
+                    );
+
+                if (hasPlayerMethod("seekTo")) {
+                    player.seekTo(targetSeconds, true);
+                } else {
+                    video.currentTime = targetSeconds;
+                }
+
+                await new Promise(resolve =>
+                    setTimeout(resolve, 250)
+                );
+
+                if (playAfterSeek) {
+                    if (hasPlayerMethod("playVideo")) {
+                        player.playVideo();
+                    } else {
+                        await video.play();
+                    }
+                }
+            };
+
             const state = () => ({
                 currentTime:
-                    video.currentTime,
+                    getCurrentTime(),
 
                 duration:
-                    video.duration,
+                    getDuration(video.duration),
 
                 paused:
-                    video.paused,
+                    hasPlayerMethod("getPlayerState")
+                        ? ![1, 3].includes(
+                            player.getPlayerState()
+                        )
+                        : video.paused,
 
                 muted:
-                    video.muted,
+                    hasPlayerMethod("isMuted")
+                        ? player.isMuted()
+                        : video.muted,
 
                 volume:
-                    video.volume,
+                    hasPlayerMethod("getVolume")
+                        ? player.getVolume() / 100
+                        : video.volume,
 
                 playbackRate:
-                    video.playbackRate,
+                    hasPlayerMethod("getPlaybackRate")
+                        ? player.getPlaybackRate()
+                        : video.playbackRate,
 
                 title:
                     document.querySelector(
@@ -1156,23 +1313,10 @@ async function runYouTubeVideoCommand(
                 case "seek": {
                     await waitForMetadata();
 
-                    const maximum =
-                        Number.isFinite(
-                            video.duration
-                        )
-                            ? video.duration
-                            : payload.seconds;
-
-                    video.currentTime =
-                        clampValue(
-                            payload.seconds,
-                            0,
-                            maximum
-                        );
-
-                    if (payload.playAfterSeek) {
-                        await video.play();
-                    }
+                    await seekTo(
+                        payload.seconds,
+                        payload.playAfterSeek
+                    );
 
                     return state();
                 }
@@ -1194,41 +1338,58 @@ async function runYouTubeVideoCommand(
                 case "changePosition": {
                     await waitForMetadata();
 
-                    const maximum =
-                        Number.isFinite(
-                            video.duration
-                        )
-                            ? video.duration
-                            : (   
-                                payload.deltaSeconds
-                            );
-
-                    video.currentTime =
-                        clampValue(
-                            payload.deltaSeconds,
-                            0,
-                            maximum
-                        );
+                    await seekTo(
+                        payload.deltaSeconds,
+                        false
+                    );
 
                     return state();
                 }
 
                 case "toggleMute":
-                    video.muted =
-                        !video.muted;
+                    if (
+                        hasPlayerMethod("isMuted") &&
+                        hasPlayerMethod("mute") &&
+                        hasPlayerMethod("unMute")
+                    ) {
+                        if (player.isMuted()) {
+                            player.unMute();
+                        } else {
+                            player.mute();
+                        }
+                    } else {
+                        video.muted =
+                            !video.muted;
+                    }
 
                     return state();
 
                 case "setVolume":
-                    video.volume =
-                        clampValue(
-                            payload.volume,
-                            0,
-                            1
+                    if (hasPlayerMethod("setVolume")) {
+                        player.setVolume(
+                            Math.round(
+                                clampValue(
+                                    payload.volume,
+                                    0,
+                                    1
+                                ) * 100
+                            )
                         );
+                    } else {
+                        video.volume =
+                            clampValue(
+                                payload.volume,
+                                0,
+                                1
+                            );
+                    }
 
-                    if (video.volume > 0) {
-                        video.muted = false;
+                    if (payload.volume > 0) {
+                        if (hasPlayerMethod("unMute")) {
+                            player.unMute();
+                        } else {
+                            video.muted = false;
+                        }
                     }
 
                     return state();
@@ -1262,11 +1423,15 @@ async function runYouTubeVideoCommand(
                                 : 0
                         ];
 
-                    video.defaultPlaybackRate =
-                        nextRate;
+                    if (hasPlayerMethod("setPlaybackRate")) {
+                        player.setPlaybackRate(nextRate);
+                    } else {
+                        video.defaultPlaybackRate =
+                            nextRate;
 
-                    video.playbackRate =
-                        nextRate;
+                        video.playbackRate =
+                            nextRate;
+                    }
 
                     return state();
                 }

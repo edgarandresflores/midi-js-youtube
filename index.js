@@ -59,6 +59,8 @@ let browser = null;
 let midiProcess = null;
 let shuttingDown = false;
 
+let rememberedYouTubeState = defaultYouTubeState();
+
 async function main() {
     browser = await puppeteer.launch({
         headless: false,
@@ -345,52 +347,45 @@ async function deathRefreshYouTube() {
     const originalUrl = page.url();
 
     let savedState = {
-        currentTime: 0,
-        paused: true,
-        muted: false,
-        volume: 1,
-        playbackRate: 1
+        ...rememberedYouTubeState
     };
 
     /*
      * Intentamos guardar el estado actual.
      * Si el renderer de YouTube está totalmente colgado,
      * page.evaluate() puede fallar y seguimos con los
-     * valores predeterminados.
+     * últimos valores recordados por el proceso Node.
      */
     try {
-        savedState = await page.evaluate(() => {
-            const video =
-                document.querySelector(
-                    "video.html5-main-video"
-                ) ??
-                document.querySelector("video");
+        savedState = rememberYouTubeState(
+            await page.evaluate(() => {
+                const video =
+                    document.querySelector(
+                        "video.html5-main-video"
+                    ) ??
+                    document.querySelector("video");
 
-            if (!video) {
+                if (!video) {
+                    return null;
+                }
+
                 return {
-                    currentTime: 0,
-                    paused: true,
-                    muted: false,
-                    volume: 1,
-                    playbackRate: 1
+                    currentTime:
+                        Number.isFinite(video.currentTime)
+                            ? video.currentTime
+                            : 0,
+
+                    paused: video.paused,
+                    muted: video.muted,
+                    volume: video.volume,
+                    playbackRate: video.playbackRate
                 };
-            }
-
-            return {
-                currentTime:
-                    Number.isFinite(video.currentTime)
-                        ? video.currentTime
-                        : 0,
-
-                paused: video.paused,
-                muted: video.muted,
-                volume: video.volume,
-                playbackRate: video.playbackRate
-            };
-        });
+            })
+        );
     } catch (error) {
         console.warn(
-            "[YouTube] No se pudo guardar el estado:",
+            "[YouTube] No se pudo leer el estado actual. " +
+            "Usando el último estado recordado:",
             error.message
         );
     }
@@ -609,6 +604,8 @@ async function deathRefreshYouTube() {
         savedState
     );
 
+    rememberYouTubeState(restoredState);
+
     console.log(
         `[YouTube] Refresh completado. ` +
         `Posición ${formatTime(restoredState.currentTime)}, ` +
@@ -617,6 +614,29 @@ async function deathRefreshYouTube() {
     );
 
     return restoredState;
+}
+
+function defaultYouTubeState() {
+    return {
+        currentTime: 0,
+        paused: true,
+        muted: false,
+        volume: 1,
+        playbackRate: 1
+    };
+}
+
+function rememberYouTubeState(state) {
+    if (!state) {
+        return rememberedYouTubeState;
+    }
+
+    rememberedYouTubeState = {
+        ...rememberedYouTubeState,
+        ...state
+    };
+
+    return rememberedYouTubeState;
 }
 
 function isRepeatedPress(controller) {
@@ -917,7 +937,7 @@ async function runYouTubeVideoCommand(
 ) {
     const page = await findYouTubePage();
 
-    return page.evaluate(
+    const result = await page.evaluate(
         async ({ command, payload }) => {
             const videos = [
                 ...document.querySelectorAll(
@@ -1263,6 +1283,10 @@ async function runYouTubeVideoCommand(
             payload
         }
     );
+
+    rememberYouTubeState(result);
+
+    return result;
 }
 
 async function clickYouTubePlayerButton(
